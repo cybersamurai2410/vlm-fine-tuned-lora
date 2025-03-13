@@ -1,50 +1,55 @@
 import torch
 from transformers import AutoProcessor, AutoModelForVision2Seq
- 
-adapter_path = "./qwen2-7b-instruct-amazon-description"
- 
-# Load Model base model
-model = AutoModelForVision2Seq.from_pretrained(
-  model_id,
-  device_map="auto",
-  torch_dtype=torch.float16
-)
-processor = AutoProcessor.from_pretrained(model_id)
-
+from peft import PeftModel
 from qwen_vl_utils import process_vision_info
- 
-# sample from amazon.com
-sample = {
-  "product_name": "Hasbro Marvel Avengers-Serie Marvel Assemble Titan-Held, Iron Man, 30,5 cm Actionfigur",
-  "catergory": "Toys & Games | Toy Figures & Playsets | Action Figures",
-  "image": "https://m.media-amazon.com/images/I/81+7Up7IWyL._AC_SY300_SX300_.jpg"
-}
- 
-# prepare message
-messages = [{
-        "role": "user",
-        "content": [
-            {
-                "type": "image",
-                "image": sample["image"],
-            },
-            {"type": "text", "text": prompt.format(product_name=sample["product_name"], category=sample["catergory"])},
-        ],
-    }
-]
- 
+
+# Define model paths (must match train.py)
+base_model_id = "Qwen/Qwen2-VL-7B-Instruct"
+adapter_path = "qwen2-finetuned"
+merged_model_path = "merged_qwen2_finetuned"
+
+# Load the base model
+base_model = AutoModelForVision2Seq.from_pretrained(
+    base_model_id,
+    device_map="auto",
+    torch_dtype=torch.float16,
+    low_cpu_mem_usage=True,
+    trust_remote_code=True
+)
+
+# Merge LoRA adapter into the base model
+peft_model = PeftModel.from_pretrained(base_model, adapter_path)
+merged_model = peft_model.merge_and_unload()
+
+# Save the fully merged model for faster inference
+merged_model.save_pretrained(merged_model_path, safe_serialization=True, max_shard_size="2GB")
+
+# Save the processor
+processor = AutoProcessor.from_pretrained(base_model_id)
+processor.save_pretrained(merged_model_path)
+
+print(f"Merged model saved at '{merged_model_path}'")
+
+# Reload the merged model for inference
+model = AutoModelForVision2Seq.from_pretrained(
+    merged_model_path,
+    device_map="auto",
+    torch_dtype=torch.float16,
+    trust_remote_code=True
+)
+processor = AutoProcessor.from_pretrained(merged_model_path)
+
+# Function to generate descriptions
 def generate_description(sample, model, processor):
     messages = [
-        {"role": "system", "content": [{"type": "text", "text": system_message}]},
+        {"role": "system", "content": [{"type": "text", "text": "You are a product description AI."}]},
         {"role": "user", "content": [
-            {"type": "image","image": sample["image"]},
-            {"type": "text", "text": prompt.format(product_name=sample["product_name"], category=sample["catergory"])},
+            {"type": "image", "image": sample["image"]},
+            {"type": "text", "text": f"Create a description for {sample['product_name']} in category {sample['category']}."}
         ]},
     ]
-    # Preparation for inference
-    text = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
+    # Prepare input for inference
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     image_inputs, video_inputs = process_vision_info(messages)
     inputs = processor(
         text=[text],
@@ -52,68 +57,22 @@ def generate_description(sample, model, processor):
         videos=video_inputs,
         padding=True,
         return_tensors="pt",
-    )
-    inputs = inputs.to(model.device)
-    # Inference: Generation of the output
+    ).to(model.device)
+
+    # Generate the product description
     generated_ids = model.generate(**inputs, max_new_tokens=256, top_p=1.0, do_sample=True, temperature=0.8)
-    generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
-    output_text = processor.batch_decode(
-        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-    )
-    return output_text[0]
- 
-# let's generate the description
-base_description = generate_description(sample, model, processor)
-print(base_description)
-# you can disable the active adapter if you want to rerun it with
-# model.disable_adapters()
-
-model.load_adapter(adapter_path) # load the adapter and activate
- 
-ft_description = generate_description(sample, model, processor)
-print(ft_description)
-
-import pandas as pd
-from IPython.display import display, HTML
- 
-def compare_generations(base_gen, ft_gen):
-    # Create a DataFrame
-    df = pd.DataFrame({
-        'Base Generation': [base_gen],
-        'Fine-tuned Generation': [ft_gen]
-    })
-    # Style the DataFrame
-    styled_df = df.style.set_properties(**{
-        'text-align': 'left',
-        'white-space': 'pre-wrap',
-        'border': '1px solid black',
-        'padding': '10px',
-        'width': '250px',  # Set width to 150px
-        'overflow-wrap': 'break-word'  # Allow words to break and wrap as needed
-    })
+    generated_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
+    output_text = processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
     
-    # Display the styled DataFrame
-    display(HTML(styled_df.to_html()))
-  
-compare_generations(base_description, ft_description)
+    return output_text[0]
 
-from peft import PeftModel
-from transformers import AutoProcessor, AutoModelForVision2Seq
- 
-adapter_path = "./qwen2-7b-instruct-amazon-description"
-base_model_id = "Qwen/Qwen2-VL-7B-Instruct"
-merged_path = "merged"
- 
-# Load Model base model
-model = AutoModelForVision2Seq.from_pretrained(model_id, low_cpu_mem_usage=True)
- 
-# Path to save the merged model
- 
-# Merge LoRA and base model and save
-peft_model = PeftModel.from_pretrained(model, adapter_path)
-merged_model = peft_model.merge_and_unload()
-merged_model.save_pretrained(merged_path,safe_serialization=True, max_shard_size="2GB")
- 
-processor = AutoProcessor.from_pretrained(base_model_id)
-processor.save_pretrained(merged_path)
+# Sample input for inference
+sample = {
+    "product_name": "Hasbro Marvel Avengers Iron Man Action Figure",
+    "category": "Toys & Games",
+    "image": "https://m.media-amazon.com/images/I/81+7Up7IWyL._AC_SY300_SX300_.jpg"
+}
 
+# Generate descriptions from the merged fine-tuned model
+fine_tuned_description = generate_description(sample, model, processor)
+print("Fine-tuned Model Description:", fine_tuned_description)
